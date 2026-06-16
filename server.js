@@ -1,0 +1,284 @@
+// ============================================================
+//  Ninja Pulse — live audience poll / word-cloud wall (#19)
+//  Zero-dependency Node server. Attendees scan a QR on the big
+//  screen, submit an answer on their phone (/vote), and the
+//  projected display (/) updates in real time as a word cloud.
+// ============================================================
+"use strict";
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+
+const DEFAULT_PROMPT = "What would you have your AI workforce do first?";
+const MAX_LEN = 40;        // per-answer char cap
+const MAX_DISTINCT = 400;  // distinct-phrase cap (anti-flood)
+
+const state = {
+  prompt: process.env.PROMPT || DEFAULT_PROMPT,
+  /** @type {Map<string,{label:string,count:number,first:number}>} */
+  words: new Map(),
+  total: 0,
+};
+
+// Quick-pick chips — one-tap answers to drive participation.
+const CHIPS = [
+  "Automate my inbox", "Build our website", "Research competitors",
+  "Write the docs", "Handle support tickets", "Analyze our data",
+  "Book my meetings", "Ship a new feature",
+];
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function jesc(s) { return JSON.stringify(String(s == null ? "" : s)); }
+
+// Normalize a submission: strip control chars, collapse whitespace, cap length.
+function normalize(raw) {
+  let t = String(raw || "")
+    .replace(/[\x00-\x1f\x7f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (t.length > MAX_LEN) t = t.slice(0, MAX_LEN).trim();
+  return t;
+}
+
+function addSubmission(raw) {
+  const label = normalize(raw);
+  if (!label) return false;
+  const key = label.toLowerCase();
+  const existing = state.words.get(key);
+  if (existing) {
+    existing.count += 1;
+  } else {
+    if (state.words.size >= MAX_DISTINCT) return false;
+    state.words.set(key, { label, count: 1, first: Date.now() });
+  }
+  state.total += 1;
+  return true;
+}
+
+function stateJSON() {
+  const words = [...state.words.values()]
+    .sort((a, b) => b.count - a.count || a.first - b.first)
+    .slice(0, 120);
+  const max = words.reduce((m, w) => Math.max(m, w.count), 0);
+  return JSON.stringify({
+    prompt: state.prompt, total: state.total, distinct: state.words.size,
+    max, words: words.map((w) => ({ t: w.label, c: w.count })),
+  });
+}
+
+// ---------- big-screen display (/) --------------------------------------
+function renderDisplay() {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Ninja Pulse — live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Overpass:wght@700;800;900&family=Roboto+Mono:wght@500&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet"/>
+<style>
+ :root{--blue:#2f6bff;--blue-b:#5b8cff;--cyan:#22d3ee;--violet:#7c5cff;--win:#36f08a;--ink:#eaf0ff;--muted:#9fb2d6;--line:rgba(120,160,255,.18)}
+ *{margin:0;box-sizing:border-box}
+ html,body{height:100%}
+ body{font-family:Roboto,system-ui,sans-serif;color:var(--ink);overflow:hidden;
+   background:radial-gradient(1200px 800px at 78% 6%,#10204d 0%,#0a1228 45%,#04060f 100%)}
+ .stage{display:grid;grid-template-rows:auto 1fr;height:100vh;padding:clamp(1rem,2.2vh,2rem) clamp(1.2rem,3vw,3rem)}
+ /* header */
+ .top{display:flex;align-items:flex-start;justify-content:space-between;gap:1.5rem}
+ .mark{font-family:Overpass;font-weight:900;letter-spacing:.2em;font-size:1rem;color:#fff}
+ .eyebrow{font-family:Overpass;font-weight:800;letter-spacing:.26em;text-transform:uppercase;
+   font-size:clamp(.6rem,1vw,.78rem);color:var(--cyan);margin-bottom:.5rem}
+ h1{font-family:Overpass;font-weight:900;line-height:1.02;letter-spacing:-.01em;
+   font-size:clamp(1.6rem,3.4vw,3rem);color:#fff;max-width:24ch}
+ .live{display:inline-flex;align-items:center;gap:.5em;font-family:Overpass;font-weight:800;
+   font-size:.72rem;letter-spacing:.1em;color:var(--win);text-transform:uppercase}
+ .dot{width:9px;height:9px;border-radius:50%;background:var(--win);box-shadow:0 0 10px var(--win);animation:blink 1.4s infinite}
+ @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+ .count{font-family:Overpass;font-weight:900;font-variant-numeric:tabular-nums;
+   font-size:clamp(2rem,4.4vw,3.6rem);color:#fff;line-height:1;text-shadow:0 0 22px rgba(91,140,255,.6)}
+ .count small{display:block;font-size:.8rem;font-weight:700;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-top:.3rem}
+ /* body: cloud + qr */
+ .body{display:grid;grid-template-columns:1fr clamp(220px,22vw,320px);gap:clamp(1rem,2.5vw,2.5rem);min-height:0;align-items:center;margin-top:1rem}
+ .cloud{height:100%;display:flex;flex-wrap:wrap;align-content:center;justify-content:center;
+   gap:.25em .55em;overflow:hidden;padding:1rem}
+ .w{font-family:Overpass;font-weight:800;line-height:1.05;letter-spacing:-.01em;
+   animation:pop .5s cubic-bezier(.2,1.2,.3,1);transition:font-size .6s ease,color .6s ease;white-space:nowrap}
+ @keyframes pop{0%{opacity:0;transform:scale(.5)}100%{opacity:1;transform:scale(1)}}
+ .empty{grid-column:1;color:var(--muted);font-size:clamp(1.1rem,2vw,1.6rem);text-align:center;width:100%}
+ .empty b{color:#fff}
+ /* qr card */
+ .qr{align-self:center;background:linear-gradient(180deg,rgba(15,26,58,.95),rgba(8,14,33,.95));
+   border:1px solid var(--line);border-radius:20px;padding:1.2rem;text-align:center;box-shadow:0 30px 80px rgba(0,0,0,.5)}
+ .qr .scan{font-family:Overpass;font-weight:800;text-transform:uppercase;letter-spacing:.14em;
+   font-size:.74rem;color:var(--cyan);margin-bottom:.8rem}
+ .qr .frame{background:#fff;border-radius:14px;padding:10px;display:inline-block;line-height:0}
+ .qr img{display:block;width:clamp(150px,15vw,230px);height:auto;border-radius:6px}
+ .qr .url{font-family:Roboto Mono,monospace;font-size:clamp(.8rem,1.1vw,1rem);color:#fff;margin-top:.9rem;word-break:break-all}
+ .qr .url b{color:var(--blue-b)}
+ .qr .go{font-family:Overpass;font-weight:700;font-size:.78rem;color:var(--muted);margin-top:.5rem}
+ footer{position:fixed;bottom:.6rem;left:0;right:0;text-align:center;font-size:.72rem;color:#6f86a3;font-family:Roboto Mono,monospace}
+ @media(max-width:760px){.body{grid-template-columns:1fr;grid-template-rows:1fr auto}.qr{order:2}}
+</style></head><body>
+<div class="stage">
+  <div class="top">
+    <div>
+      <div class="mark">NINJA 🥷</div>
+      <p class="eyebrow">Live audience pulse · Foundry Live · GitHub SF</p>
+      <h1 id="prompt">${esc(state.prompt)}</h1>
+    </div>
+    <div style="text-align:right">
+      <div class="live"><span class="dot"></span> Live</div>
+      <div class="count"><span id="total">0</span><small>answers</small></div>
+    </div>
+  </div>
+  <div class="body">
+    <div class="cloud" id="cloud"><div class="empty">Be the first — <b>scan the code</b> and tell us what your AI workforce should do first 👉</div></div>
+    <div class="qr">
+      <div class="scan">📱 Scan to join</div>
+      <div class="frame"><img id="qr" alt="Scan to vote"/></div>
+      <div class="url">go to <b id="voteurl">…</b></div>
+      <div class="go">it takes 5 seconds</div>
+    </div>
+  </div>
+</div>
+<footer>ninja-pulse · built &amp; deployed live by a NinjaTech AI employee</footer>
+<script>
+ var COLORS=["#5b8cff","#22d3ee","#36f08a","#7c5cff","#9fb2d6","#ffffff","#3b9bff"];
+ var voteURL=location.origin+"/vote";
+ document.getElementById("voteurl").textContent=location.host+"/vote";
+ document.getElementById("qr").src="https://api.qrserver.com/v1/create-qr-code/?size=320x320&margin=6&qzone=1&data="+encodeURIComponent(voteURL);
+ var cloud=document.getElementById("cloud"), seen={};
+ function sizeFor(c,max){var min=20,maxpx=Math.min(window.innerWidth,window.innerHeight)*0.115+30;
+   if(max<=1)return (min+22);var t=Math.log(c)/Math.log(max);return Math.round(min+t*(maxpx-min));}
+ function render(d){
+   document.getElementById("total").textContent=d.total;
+   document.getElementById("prompt").textContent=d.prompt;
+   if(!d.words.length){return;}
+   if(cloud.querySelector(".empty"))cloud.innerHTML="";
+   var keep={};
+   d.words.forEach(function(w,i){
+     keep[w.t]=1;
+     var el=seen[w.t];
+     if(!el){el=document.createElement("span");el.className="w";el.textContent=w.t;cloud.appendChild(el);seen[w.t]=el;}
+     el.style.fontSize=sizeFor(w.c,d.max)+"px";
+     el.style.color=COLORS[(w.t.length+w.c)%COLORS.length];
+     el.style.opacity=Math.max(.55,Math.min(1,.55+w.c/(d.max||1)*.45));
+     el.title=w.c+(w.c===1?" vote":" votes");
+     el._c=w.c;
+   });
+   // drop words no longer in top set (e.g. after reset)
+   Object.keys(seen).forEach(function(k){if(!keep[k]){cloud.removeChild(seen[k]);delete seen[k];}});
+   // order by count
+   [].slice.call(cloud.children).sort(function(a,b){return (b._c||0)-(a._c||0);}).forEach(function(n){cloud.appendChild(n);});
+ }
+ function poll(){fetch("/api/state").then(function(r){return r.json();}).then(render).catch(function(){});}
+ poll();setInterval(poll,1500);
+</script>
+</body></html>`;
+}
+
+// ---------- mobile submit page (/vote) ----------------------------------
+function renderVote() {
+  const chips = CHIPS.map((c) => `<button type="button" class="chip" data-v="${esc(c)}">${esc(c)}</button>`).join("");
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Add your voice · Ninja Pulse</title>
+<link href="https://fonts.googleapis.com/css2?family=Overpass:wght@700;800;900&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet"/>
+<style>
+ :root{--blue:#2f6bff;--blue-b:#5b8cff;--cyan:#22d3ee;--violet:#7c5cff;--win:#36f08a;--ink:#eaf0ff;--muted:#9fb2d6;--line:rgba(120,160,255,.2)}
+ *{margin:0;box-sizing:border-box}
+ body{font-family:Roboto,system-ui,sans-serif;color:var(--ink);min-height:100vh;padding:6vh 6vw env(safe-area-inset-bottom);
+   background:radial-gradient(900px 600px at 80% 0%,#10204d,#0a1228 55%,#04060f)}
+ .mark{font-family:Overpass;font-weight:900;letter-spacing:.2em;font-size:.95rem;color:#fff;margin-bottom:1.4rem}
+ .eyebrow{font-family:Overpass;font-weight:800;letter-spacing:.22em;text-transform:uppercase;font-size:.7rem;color:var(--cyan);margin-bottom:.6rem}
+ h1{font-family:Overpass;font-weight:900;line-height:1.05;font-size:clamp(1.5rem,7vw,2.2rem);color:#fff;margin-bottom:1.4rem}
+ label{font-size:.8rem;color:var(--muted);font-weight:600;display:block;margin-bottom:.5rem}
+ .chips{display:flex;flex-wrap:wrap;gap:.55rem;margin-bottom:1.3rem}
+ .chip{font-family:Overpass;font-weight:700;font-size:.92rem;color:var(--ink);background:rgba(47,107,255,.1);
+   border:1px solid var(--line);border-radius:999px;padding:.6em 1em;cursor:pointer;-webkit-tap-highlight-color:transparent}
+ .chip:active{transform:scale(.96);background:rgba(47,107,255,.26)}
+ form{display:flex;gap:.6rem}
+ input{flex:1;background:#070d20;border:1px solid #2a3a66;border-radius:12px;color:var(--ink);
+   font-size:1.05rem;padding:.9rem 1rem;outline:none}
+ input:focus{border-color:var(--blue)}
+ button.go{font-family:Overpass;font-weight:800;font-size:1.02rem;color:#05070f;border:none;border-radius:12px;
+   padding:.9rem 1.2rem;background:linear-gradient(100deg,var(--blue-b),var(--cyan));cursor:pointer;white-space:nowrap}
+ button.go:disabled{opacity:.6}
+ .ok{display:none;margin-top:1.6rem;background:rgba(54,240,138,.1);border:1px solid rgba(54,240,138,.35);
+   border-radius:14px;padding:1.1rem 1.2rem}
+ .ok.show{display:block;animation:pop .4s}
+ @keyframes pop{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:none}}
+ .ok b{color:var(--win)}.ok .added{font-family:Overpass;font-weight:800;font-size:1.15rem;color:#fff;margin:.3rem 0}
+ .hint{margin-top:1.2rem;font-size:.82rem;color:var(--muted)}
+ .big{font-size:.95rem;color:var(--muted);margin-bottom:1.6rem}
+</style></head><body>
+ <div class="mark">NINJA 🥷</div>
+ <p class="eyebrow">Live audience pulse</p>
+ <h1 id="q">${esc(state.prompt)}</h1>
+ <p class="big">Tap one — or type your own. It pops up on the big screen in seconds.</p>
+ <label>Quick picks</label>
+ <div class="chips">${chips}</div>
+ <label for="t">Your own answer</label>
+ <form id="f">
+   <input id="t" type="text" maxlength="${MAX_LEN}" placeholder="e.g. plan our offsite" autocomplete="off"/>
+   <button class="go" type="submit">Send →</button>
+ </form>
+ <div class="ok" id="ok">✅ <b>On the wall!</b><div class="added" id="added"></div>Add another anytime 👇</div>
+ <p class="hint">Anonymous · ${MAX_LEN}-char max · be nice 🙂</p>
+<script>
+ var f=document.getElementById("f"),t=document.getElementById("t"),ok=document.getElementById("ok"),added=document.getElementById("added");
+ function submit(v){v=(v||"").trim();if(!v)return;
+   fetch("/api/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:v})})
+     .then(function(r){return r.json();}).then(function(d){
+       if(d&&d.ok){added.textContent="“"+d.text+"”";ok.classList.add("show");t.value="";
+         if(navigator.vibrate)navigator.vibrate(30);}
+     }).catch(function(){});
+ }
+ document.querySelectorAll(".chip").forEach(function(c){c.addEventListener("click",function(){submit(c.getAttribute("data-v"));});});
+ f.addEventListener("submit",function(e){e.preventDefault();submit(t.value);});
+ fetch("/api/state").then(function(r){return r.json();}).then(function(d){if(d&&d.prompt)document.getElementById("q").textContent=d.prompt;}).catch(function(){});
+</script>
+</body></html>`;
+}
+
+function send(res, code, type, body) {
+  res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
+  res.end(body);
+}
+
+const server = http.createServer((req, res) => {
+  const u = req.url || "/";
+  const path = u.split("?")[0];
+  const qs = u.indexOf("?") >= 0 ? new URLSearchParams(u.slice(u.indexOf("?") + 1)) : new URLSearchParams();
+
+  if (path === "/healthz") return send(res, 200, "text/plain", "ok");
+
+  if (path === "/") {
+    if (qs.has("q")) state.prompt = normalize(qs.get("q")).slice(0, 90) || state.prompt;
+    return send(res, 200, "text/html; charset=utf-8", renderDisplay());
+  }
+  if (path === "/vote") return send(res, 200, "text/html; charset=utf-8", renderVote());
+  if (path === "/api/state") return send(res, 200, "application/json", stateJSON());
+
+  if (path === "/api/submit" && req.method === "POST") {
+    let buf = "";
+    req.on("data", (c) => { buf += c; if (buf.length > 2000) req.destroy(); });
+    req.on("end", () => {
+      let body; try { body = JSON.parse(buf || "{}"); } catch { body = {}; }
+      const label = normalize(body.text);
+      const ok = addSubmission(body.text);
+      send(res, 200, "application/json", JSON.stringify({ ok, text: label }));
+    });
+    return;
+  }
+
+  if (path === "/api/reset" && req.method === "POST") {
+    state.words.clear(); state.total = 0;
+    if (qs.has("q")) state.prompt = normalize(qs.get("q")).slice(0, 90) || DEFAULT_PROMPT;
+    return send(res, 200, "application/json", JSON.stringify({ ok: true, prompt: state.prompt }));
+  }
+
+  send(res, 404, "text/plain", "Not found");
+});
+
+server.listen(PORT, () => console.log("ninja-pulse on " + PORT));
